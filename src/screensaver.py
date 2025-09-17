@@ -46,6 +46,7 @@ PALETTE_IMAGE = build_palette_image()
 
 def _build_penrose_basis() -> List[Tuple[float, float]]:
     """Return the five unit vectors used for the Penrose pentagrid basis."""
+
     basis: List[Tuple[float, float]] = []
     for index in range(5):
         angle = 2 * math.pi * index / 5.0
@@ -53,46 +54,32 @@ def _build_penrose_basis() -> List[Tuple[float, float]]:
     return basis
 
 
-def _apply_scaling(
-    points: Iterable[Tuple[float, float]],
-    width: int,
-    height: int,
-    margin: int,
-) -> Tuple[List[Tuple[float, float]], Tuple[float, float, float, float]]:
-    """Scale an iterable of points to fill the drawing rectangle with padding."""
+def _normalise_offsets(offset_phase: float) -> List[float]:
+    """Return pentagrid offsets that satisfy Penrose matching constraints."""
 
-    xs = [x for x, _ in points]
-    ys = [y for _, y in points]
-    if not xs or not ys:
-        raise ValueError("Penrose generator produced no vertices")
+    raw_offsets = []
+    for index in range(5):
+        phase = (offset_phase + index / 5.0) % 1.0
+        if phase >= 0.5:
+            phase -= 1.0
+        raw_offsets.append(phase)
 
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span_x = max_x - min_x
-    span_y = max_y - min_y
-    if span_x == 0 or span_y == 0:
-        raise ValueError("Degenerate Penrose patch dimensions detected")
+    average = sum(raw_offsets) / 5.0
+    offsets = [phase - average for phase in raw_offsets]
 
-    scale_x = (width - 2 * margin) / span_x
-    scale_y = (height - 2 * margin) / span_y
-    offset_x = margin - scale_x * min_x
-    offset_y = margin - scale_y * min_y
+    eps = 1e-4
+    total_adjustment = 0.0
+    for idx, value in enumerate(offsets):
+        if abs(value - round(value)) < eps:
+            delta = eps if value >= 0 else -eps
+            offsets[idx] += delta
+            total_adjustment += delta
 
-    scaled = [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in points]
-    return scaled, (scale_x, scale_y, offset_x, offset_y)
+    if abs(total_adjustment) > 0:
+        correction = total_adjustment / 5.0
+        offsets = [value - correction for value in offsets]
 
-
-def _safe_mod(value: float) -> float:
-    """Return a fractional offset constrained to (0, 1)."""
-
-    frac = value % 1.0
-    eps = 1e-6
-    if frac < eps:
-        frac += eps
-    if frac > 1.0 - eps:
-        frac -= eps
-    return frac
-
+    return offsets
 
 def generate_penrose_patch(
     limit: int,
@@ -104,7 +91,7 @@ def generate_penrose_patch(
         raise ValueError("--limit must be at least 1 for Penrose tiling generation")
 
     basis = _build_penrose_basis()
-    gammas = [_safe_mod(offset_phase + index / 5.0) for index in range(5)]
+    gammas = _normalise_offsets(offset_phase)
 
     index_range = range(-limit, limit + 1)
     vertices: dict[Tuple[int, int, int, int, int], Tuple[float, float]] = {}
@@ -122,6 +109,12 @@ def generate_penrose_patch(
         y = (ei_x * cj - ej_x * ci) / det
         return x, y
 
+    def compute_index(value: float) -> int:
+        nearest = round(value)
+        if abs(value - nearest) < 1e-9:
+            return int(nearest)
+        return int(math.ceil(value))
+
     for i in range(5):
         for j in range(i + 1, 5):
             for ki in index_range:
@@ -132,8 +125,8 @@ def generate_penrose_patch(
                     x, y = intersection
                     base_indices = []
                     for idx, (bx, by) in enumerate(basis):
-                        value = bx * x + by * y - gammas[idx]
-                        base_indices.append(int(math.ceil(value - 1e-9)))
+                        projection = bx * x + by * y - gammas[idx]
+                        base_indices.append(compute_index(projection))
 
                     for di in (0, 1):
                         for dj in (0, 1):
@@ -141,9 +134,10 @@ def generate_penrose_patch(
                             key_list[i] += di
                             key_list[j] += dj
                             key = tuple(key_list)  # type: ignore[assignment]
-                            px = sum(key_list[idx] * basis[idx][0] for idx in range(5))
-                            py = sum(key_list[idx] * basis[idx][1] for idx in range(5))
-                            vertices.setdefault(key, (px, py))
+                            if key not in vertices:
+                                px = sum(key_list[idx] * basis[idx][0] for idx in range(5))
+                                py = sum(key_list[idx] * basis[idx][1] for idx in range(5))
+                                vertices[key] = (px, py)
 
                     grid_indices[i].add(ki)
                     grid_indices[j].add(kj)
@@ -151,48 +145,116 @@ def generate_penrose_patch(
     if not vertices:
         raise ValueError("Penrose generator produced no vertices; increase --limit")
 
-    sorted_keys = sorted(vertices.keys())
-    raw_points = [vertices[key] for key in sorted_keys]
-    scaled_points, transform = _apply_scaling(raw_points, WIDTH, HEIGHT, MARGIN)
-    scale_x, scale_y, offset_x, offset_y = transform
+    sorted_items = sorted(vertices.items())
+    raw_points = [value for _, value in sorted_items]
 
-    def apply_transform(point: Tuple[float, float]) -> Tuple[float, float]:
-        return (point[0] * scale_x + offset_x, point[1] * scale_y + offset_y)
+    min_x = min(x for x, _ in raw_points)
+    max_x = max(x for x, _ in raw_points)
+    min_y = min(y for _, y in raw_points)
+    max_y = max(y for _, y in raw_points)
 
-    bounds = (
-        min(x for x, _ in raw_points) - 1.0,
-        max(x for x, _ in raw_points) + 1.0,
-        min(y for _, y in raw_points) - 1.0,
-        max(y for _, y in raw_points) + 1.0,
-    )
+    target_vertices = 1250
+    crop_ratio = 1.0
 
-    def clip_line(
-        normal: Tuple[float, float],
-        constant: float,
-    ) -> Tuple[Tuple[float, float], Tuple[float, float]] | None:
+    def build_scaled(crop: float):
+        span_x = (max_x - min_x) * crop
+        span_y = (max_y - min_y) * crop
+        if span_x <= 0 or span_y <= 0:
+            raise ValueError("Invalid Penrose crop dimensions")
+        scale = min((WIDTH - 2 * MARGIN) / span_x, (HEIGHT - 2 * MARGIN) / span_y)
+        center_x = 0.5 * (min_x + max_x)
+        center_y = 0.5 * (min_y + max_y)
+        raw_x_min = center_x - span_x / 2.0
+        raw_x_max = center_x + span_x / 2.0
+        raw_y_min = center_y - span_y / 2.0
+        raw_y_max = center_y + span_y / 2.0
+
+        def transform(point: Tuple[float, float]) -> Tuple[float, float]:
+            px, py = point
+            sx = (px - center_x) * scale + WIDTH / 2.0
+            sy = (py - center_y) * scale + HEIGHT / 2.0
+            return sx, sy
+
+        tol = 1e-9
+        filtered_scaled: List[Tuple[float, float]] = []
+        for (_, raw_point) in sorted_items:
+            rx, ry = raw_point
+            if (
+                raw_x_min - tol <= rx <= raw_x_max + tol
+                and raw_y_min - tol <= ry <= raw_y_max + tol
+            ):
+                filtered_scaled.append(transform(raw_point))
+        return (
+            filtered_scaled,
+            scale,
+            center_x,
+            center_y,
+            raw_x_min,
+            raw_x_max,
+            raw_y_min,
+            raw_y_max,
+        )
+
+    scaled_points, scale, center_x, center_y, raw_x_min, raw_x_max, raw_y_min, raw_y_max = build_scaled(crop_ratio)
+
+    if len(scaled_points) > target_vertices:
+        min_ratio = 0.35
+        while len(scaled_points) > target_vertices and crop_ratio > min_ratio:
+            crop_ratio *= math.sqrt(target_vertices / len(scaled_points))
+            crop_ratio = max(crop_ratio, min_ratio)
+            (
+                scaled_points,
+                scale,
+                center_x,
+                center_y,
+                raw_x_min,
+                raw_x_max,
+                raw_y_min,
+                raw_y_max,
+            ) = build_scaled(crop_ratio)
+        if len(scaled_points) > target_vertices:
+            crop_ratio = min_ratio
+            (
+                scaled_points,
+                scale,
+                center_x,
+                center_y,
+                raw_x_min,
+                raw_x_max,
+                raw_y_min,
+                raw_y_max,
+            ) = build_scaled(crop_ratio)
+
+    def to_scaled(point: Tuple[float, float]) -> Tuple[float, float]:
+        px, py = point
+        sx = (px - center_x) * scale + WIDTH / 2.0
+        sy = (py - center_y) * scale + HEIGHT / 2.0
+        return sx, sy
+
+    def clip_line(normal: Tuple[float, float], constant: float):
         nx, ny = normal
-        x_min, x_max, y_min, y_max = bounds
         intersections: List[Tuple[float, float]] = []
+        tol = 1e-9
         if abs(ny) > 1e-12:
-            for x_edge in (x_min, x_max):
+            for x_edge in (raw_x_min, raw_x_max):
                 y_val = (constant - nx * x_edge) / ny
-                if y_min - 1e-9 <= y_val <= y_max + 1e-9:
+                if raw_y_min - tol <= y_val <= raw_y_max + tol:
                     intersections.append((x_edge, y_val))
         if abs(nx) > 1e-12:
-            for y_edge in (y_min, y_max):
+            for y_edge in (raw_y_min, raw_y_max):
                 x_val = (constant - ny * y_edge) / nx
-                if x_min - 1e-9 <= x_val <= x_max + 1e-9:
+                if raw_x_min - tol <= x_val <= raw_x_max + tol:
                     intersections.append((x_val, y_edge))
 
         unique: List[Tuple[float, float]] = []
         for candidate in intersections:
-            if not any(math.hypot(candidate[0] - pt[0], candidate[1] - pt[1]) < 1e-6 for pt in unique):
+            if not any(math.hypot(candidate[0] - other[0], candidate[1] - other[1]) < 1e-6 for other in unique):
                 unique.append(candidate)
             if len(unique) == 2:
                 break
         if len(unique) < 2:
             return None
-        return apply_transform(unique[0]), apply_transform(unique[1])
+        return to_scaled(unique[0]), to_scaled(unique[1])
 
     grid_segments: List[List[Tuple[Tuple[float, float], Tuple[float, float]]]] = [[] for _ in range(5)]
     for index in range(5):
