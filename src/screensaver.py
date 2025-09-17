@@ -16,11 +16,11 @@ import math
 import random
 import statistics
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 from PIL import Image, ImageDraw
-from dataclasses import dataclass
 
 WIDTH = 540
 HEIGHT = 960
@@ -50,20 +50,38 @@ PALETTE_IMAGE = build_palette_image()
 
 
 @dataclass
+class TilingPatch:
+    """Container holding vertex coordinates and edge connectivity for a patch."""
+
+    points: List[Tuple[float, float]]
+    edges: List[Tuple[int, int]]
+
+
+@dataclass
 class CycleBias:
     """Metadata describing how to bias the Hamiltonian towards circular motifs."""
 
     radii: List[float]
     angles: List[float]
     ring_ids: List[int]
-    target_steps: List[float]
+    ring_positions: List[float]
+    ring_norm_spacing: List[float]
     radius_scale: float
     mean_radius: float
     radial_weight: float
     angle_weight: float
+    cross_weight: float
+    skip_weight: float
+    skip_multiplier: float
+    drift_weight: float
+    spiral_strength: float
+    spiral_frequency: int
+    spiral_phase: float
+    spiral_direction: int
     direction: int
     ring_counts: List[int]
     remaining_per_ring: List[int]
+    ring_width: float
     jitter: float
 
 
@@ -103,35 +121,63 @@ def compute_cycle_bias(points: Sequence[Tuple[float, float]], rng: random.Random
     for ring_index in ring_ids:
         ring_counts[ring_index] += 1
 
-    target_steps: List[float] = []
-    for ring_index in ring_ids:
-        count = max(1, ring_counts[ring_index])
-        # A simple proxy for the angular separation of vertices within the ring.
-        target_steps.append(2 * math.pi / count)
+    ring_members: List[List[Tuple[float, int]]] = [[] for _ in range(ring_count)]
+    for index, (ring_index, angle) in enumerate(zip(ring_ids, angles)):
+        ring_members[ring_index].append((angle, index))
+
+    ring_positions = [0.0] * len(points)
+    ring_norm_spacing = [1.0] * ring_count
+    for ring_index, members in enumerate(ring_members):
+        if not members:
+            continue
+        members.sort(key=lambda pair: pair[0])
+        offset = rng.random()
+        count = len(members)
+        ring_norm_spacing[ring_index] = 1.0 / count
+        for order, (_, idx) in enumerate(members):
+            ring_positions[idx] = (order + offset) / count
 
     mean_radius = sum(radii) / len(radii)
     radius_scale = statistics.pstdev(radii)
     if radius_scale <= 1e-6:
         radius_scale = max(mean_radius, 1.0)
 
-    radial_weight = mean_radius
-    angle_weight = max(24.0, mean_radius / 2.0)
+    radial_weight = max(16.0, radius_span / 4.0, mean_radius * 0.25)
+    angle_weight = max(8.0, radius_span / 6.0)
+    cross_weight = angle_weight * 0.6
+    skip_weight = angle_weight * 1.4
+    skip_multiplier = 2.4
+    drift_weight = radial_weight * 0.45
+    spiral_strength = max(ring_width, radius_scale / max(1, ring_count)) * rng.uniform(0.85, 1.4)
+    spiral_frequency = rng.choice([2, 3, 4, 5])
+    spiral_phase = rng.random() * (2 * math.pi)
+    spiral_direction = rng.choice([-1, 1])
     direction = rng.choice([-1, 1])
     remaining_per_ring = ring_counts.copy()
-    jitter = max(0.05, radius_span / len(points) * 0.5)
+    jitter = max(0.05, radius_span / len(points) * 0.4)
 
     return CycleBias(
         radii=radii,
         angles=angles,
         ring_ids=ring_ids,
-        target_steps=target_steps,
+        ring_positions=ring_positions,
+        ring_norm_spacing=ring_norm_spacing,
         radius_scale=radius_scale,
         mean_radius=mean_radius,
         radial_weight=radial_weight,
         angle_weight=angle_weight,
+        cross_weight=cross_weight,
+        skip_weight=skip_weight,
+        skip_multiplier=skip_multiplier,
+        drift_weight=drift_weight,
+        spiral_strength=spiral_strength,
+        spiral_frequency=spiral_frequency,
+        spiral_phase=spiral_phase,
+        spiral_direction=spiral_direction,
         direction=direction,
         ring_counts=ring_counts,
         remaining_per_ring=remaining_per_ring,
+        ring_width=ring_width,
         jitter=jitter,
     )
 
@@ -151,33 +197,60 @@ def _biased_transition_cost(
 
     r_current = bias.radii[current]
     r_candidate = bias.radii[candidate]
-    dr = abs(r_candidate - r_current)
+    ring_current = bias.ring_ids[current]
+    ring_candidate = bias.ring_ids[candidate]
+    ring_gap = abs(ring_candidate - ring_current)
 
-    ring_index = bias.ring_ids[candidate]
-    ring_total = max(1, bias.ring_counts[ring_index])
-    remaining = max(0, bias.remaining_per_ring[ring_index])
-    remaining_ratio = remaining / ring_total
-    radial_weight = bias.radial_weight * (0.25 + 0.75 * remaining_ratio)
-    radial_penalty = radial_weight * (dr / bias.radius_scale) ** 2
+    ring_width = max(bias.ring_width, 1e-6)
+    remaining = max(0, bias.remaining_per_ring[ring_current])
+    total = max(1, bias.ring_counts[ring_current])
+    remaining_ratio = remaining / total
+    base_weight = bias.radial_weight * (0.35 + 0.65 * remaining_ratio)
+    radial_penalty = base_weight * ((abs(r_candidate - r_current) / ring_width) ** 2)
+    if ring_gap > 0:
+        radial_penalty *= 1.0 + 0.6 * ring_gap
 
-    theta_current = bias.angles[current]
-    theta_candidate = bias.angles[candidate]
-    if bias.direction > 0:
-        diff = (theta_candidate - theta_current) % (2 * math.pi)
+    pos_current = bias.ring_positions[current]
+    pos_candidate = bias.ring_positions[candidate]
+    forward = (pos_candidate - pos_current) % 1.0
+    backward = (pos_current - pos_candidate) % 1.0
+    if bias.direction < 0:
+        forward, backward = backward, forward
+
+    if ring_current == ring_candidate:
+        target = bias.ring_norm_spacing[ring_current]
+        if target <= 0:
+            target = 1.0
+        angle_penalty = bias.angle_weight * (forward - target) ** 2
+        skip_threshold = target * bias.skip_multiplier
+        if forward > skip_threshold:
+            angle_penalty += bias.skip_weight * (forward - skip_threshold) ** 2
     else:
-        diff = (theta_current - theta_candidate) % (2 * math.pi)
+        alignment = min(forward, backward)
+        angle_penalty = bias.cross_weight * alignment ** 2
+        if ring_gap > 1:
+            angle_penalty *= 1.0 + 0.4 * (ring_gap - 1)
 
-    target = (bias.target_steps[current] + bias.target_steps[candidate]) * 0.5
-    angle_penalty = bias.angle_weight * (diff - target) ** 2
-    if diff > math.pi:
-        # Strongly discourage hard reversals that fold the loop back onto itself.
-        angle_penalty += bias.angle_weight * 0.25 * (diff - math.pi) ** 2
+    spiral = math.sin(
+        bias.spiral_frequency * pos_current * (2 * math.pi) + bias.spiral_phase
+    )
+    desired_radius = r_current + bias.spiral_direction * spiral * bias.spiral_strength
+    drift_scale = 0.5 if ring_gap == 0 else 1.0 + 0.25 * ring_gap
+    drift_penalty = bias.drift_weight * drift_scale * (
+        (r_candidate - desired_radius) / (ring_width * 1.5)
+    ) ** 2
 
-    return distance + radial_penalty + angle_penalty + bias.jitter * rng.random()
+    return (
+        distance
+        + radial_penalty
+        + angle_penalty
+        + drift_penalty
+        + bias.jitter * rng.random()
+    )
 
 
-def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tuple[float, float]]:
-    """Generate vertex coordinates for an Ammann–Beenker tiling patch."""
+def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPatch:
+    """Generate an Ammann–Beenker tiling patch with vertex and edge data."""
     angles = [index * math.pi / 4 for index in range(4)]
     physical = [(math.cos(angle), math.sin(angle)) for angle in angles]
     perpendicular = [
@@ -185,6 +258,7 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
     ]
 
     coords: List[Tuple[float, float]] = []
+    lattice_vectors: List[Tuple[int, int, int, int]] = []
     for vector in itertools.product(range(-limit, limit + 1), repeat=4):
         x = y = u = v = 0.0
         for coefficient, (px, py), (qx, qy) in zip(vector, physical, perpendicular):
@@ -194,9 +268,23 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
             v += coefficient * qy
         if max(abs(u), abs(v)) <= window:
             coords.append((x, y))
+            lattice_vectors.append(tuple(vector))
 
     if not coords:
         raise ValueError("No tiling vertices were generated; adjust --limit/--window")
+
+    index_by_vector: Dict[Tuple[int, int, int, int], int] = {
+        vector: idx for idx, vector in enumerate(lattice_vectors)
+    }
+    edges: List[Tuple[int, int]] = []
+    for idx, vector in enumerate(lattice_vectors):
+        for dim in range(4):
+            neighbour = list(vector)
+            neighbour[dim] += 1
+            neighbour_tuple = tuple(neighbour)
+            neighbour_idx = index_by_vector.get(neighbour_tuple)
+            if neighbour_idx is not None:
+                edges.append((idx, neighbour_idx))
 
     # Apply a random dihedral-8 symmetry to keep runs varied.
     # Restrict the rotation to multiples of 90° so the patch stays axis aligned.
@@ -229,7 +317,9 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
     offset_x = MARGIN - scale_x * min_x
     offset_y = MARGIN - scale_y * min_y
 
-    return [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in transformed]
+    points = [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in transformed]
+
+    return TilingPatch(points=points, edges=edges)
 
 
 def nearest_neighbour_cycle(
@@ -361,6 +451,34 @@ def render_static(
     return image
 
 
+def render_tiling(
+    points: Sequence[Tuple[float, float]],
+    edges: Sequence[Tuple[int, int]],
+    background_level: int,
+    edge_level: int,
+    vertex_level: int,
+    line_width: int,
+    output_path: Path,
+) -> Image.Image:
+    """Render only the Ammann–Beenker tiling geometry."""
+
+    image = Image.new("L", (WIDTH, HEIGHT), color=gray_level(background_level))
+    draw = ImageDraw.Draw(image)
+
+    for a, b in edges:
+        ax, ay = points[a]
+        bx, by = points[b]
+        draw.line((ax, ay, bx, by), fill=gray_level(edge_level), width=line_width)
+
+    if vertex_level >= 0:
+        vertex_value = gray_level(vertex_level)
+        for x, y in points:
+            draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=vertex_value, outline=None)
+
+    image.save(output_path)
+    return image
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=7, help="Cut-and-project search radius (default: 7)")
@@ -443,7 +561,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     rng = random.Random(args.seed)
     logging.info(f"Generating Ammann–Beenker patch (limit={args.limit}, window={args.window})")
     try:
-        points = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
+        patch = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
+        points = patch.points
         logging.info(f"Generated {len(points)} vertices.")
         logging.info(f"Building Hamiltonian cycle with {args.two_opt_rounds} two-opt rounds.")
         cycle = build_cycle(points, rng=rng, two_opt_rounds=args.two_opt_rounds)
@@ -464,6 +583,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             output_path=output_path,
         )
         logging.info("Static image rendering complete.")
+        tiling_path = output_path.with_name(f"{output_path.stem}-tiling{output_path.suffix}")
+        logging.info(f"Rendering tiling image to {tiling_path}")
+        render_tiling(
+            points=patch.points,
+            edges=patch.edges,
+            background_level=background_level,
+            edge_level=min(GRAY_LEVELS - 1, patch_level + 4),
+            vertex_level=patch_level,
+            line_width=max(1, args.line_width - 1),
+            output_path=tiling_path,
+        )
+        logging.info("Tiling image rendering complete.")
     except Exception as e:
         logging.error(f"Error: {e}")
         raise
