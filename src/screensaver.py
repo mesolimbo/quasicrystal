@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import logging
 import math
 import random
 import time
@@ -91,13 +92,14 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
     if span_x == 0 or span_y == 0:
         raise ValueError("Degenerate patch dimensions detected")
 
+    # --- Aspect ratio fix ---
+    # Instead of uniform scaling, stretch to fill the rectangle
     scale_x = (WIDTH - 2 * MARGIN) / span_x
     scale_y = (HEIGHT - 2 * MARGIN) / span_y
-    scale = min(scale_x, scale_y)
-    offset_x = (WIDTH - scale * span_x) / 2 - scale * min_x
-    offset_y = (HEIGHT - scale * span_y) / 2 - scale * min_y
+    offset_x = MARGIN - scale_x * min_x
+    offset_y = MARGIN - scale_y * min_y
 
-    return [(scale * x + offset_x, scale * y + offset_y) for x, y in transformed]
+    return [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in transformed]
 
 
 def nearest_neighbour_cycle(points: Sequence[Tuple[float, float]], rng: random.Random) -> List[int]:
@@ -181,61 +183,38 @@ def quantise_frames(frames: Sequence[Image.Image]) -> List[Image.Image]:
     return [frame.quantize(palette=PALETTE_IMAGE) for frame in frames]
 
 
-def render_animation(
+def render_static(
     points: Sequence[Tuple[float, float]],
     cycle: Sequence[int],
-    sleep_seconds: float,
-    max_refreshes: int,
-    segments_per_refresh: int | None,
-    line_width: int,
-    ink_level: int,
+    patch_level: int,
+    cycle_level: int,
     background_level: int,
-    gif_path: Path,
-    frames_dir: Path | None,
-    dry_run: bool,
-) -> List[Image.Image]:
-    """Draw the curve incrementally and return the rendered frames."""
+    line_width: int,
+    output_path: Path,
+) -> Image.Image:
+    """Render the patch and cycle as a single static image."""
+    image = Image.new("L", (WIDTH, HEIGHT), color=gray_level(background_level))
+    draw = ImageDraw.Draw(image)
+
+    # Draw patch vertices in faint gray
+    for x, y in points:
+        draw.ellipse(
+            (x - 1, y - 1, x + 1, y + 1),
+            fill=gray_level(patch_level),
+            outline=None,
+        )
+
+    # Draw cycle in bright white
     extended_cycle = list(cycle) + [cycle[0]]
-    total_segments = len(extended_cycle) - 1
-    batches = max(1, max_refreshes)
-    if segments_per_refresh is None:
-        segments_per_refresh = max(1, math.ceil(total_segments / batches))
-    else:
-        segments_per_refresh = max(1, segments_per_refresh)
+    for a, b in zip(extended_cycle[:-1], extended_cycle[1:]):
+        draw.line(
+            (*points[a], *points[b]),
+            fill=gray_level(cycle_level),
+            width=line_width,
+        )
 
-    base_image = Image.new("L", (WIDTH, HEIGHT), color=gray_level(background_level))
-    draw = ImageDraw.Draw(base_image)
-    frames: List[Image.Image] = []
-
-    if frames_dir is not None:
-        frames_dir.mkdir(parents=True, exist_ok=True)
-
-    for batch_index, (start, end) in enumerate(iter_batches(total_segments, segments_per_refresh)):
-        for segment_index in range(start, end):
-            a = extended_cycle[segment_index]
-            b = extended_cycle[segment_index + 1]
-            draw.line((*points[a], *points[b]), fill=gray_level(ink_level), width=line_width)
-        frame = base_image.copy()
-        frames.append(frame)
-        if frames_dir is not None:
-            frame_path = frames_dir / f"frame_{batch_index:04d}.bmp"
-            frame.save(frame_path)
-        if not dry_run and (batch_index < (total_segments - 1) // segments_per_refresh):
-            time.sleep(sleep_seconds)
-
-    if not frames:
-        frames.append(base_image)
-
-    quantised = quantise_frames(frames)
-    quantised[0].save(
-        gif_path,
-        save_all=True,
-        append_images=quantised[1:],
-        loop=0,
-        duration=int(max(0.1, sleep_seconds) * 1000),
-        disposal=2,
-    )
-    return frames
+    image.save(output_path)
+    return image
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -311,23 +290,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+    logging.info("Screensaver tool started.")
     args = parse_args(argv)
     rng = random.Random(args.seed)
-    points = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
-    cycle = build_cycle(points, rng=rng, two_opt_rounds=args.two_opt_rounds)
-    render_animation(
-        points=points,
-        cycle=cycle,
-        sleep_seconds=args.sleep,
-        max_refreshes=args.max_refreshes,
-        segments_per_refresh=args.segments_per_refresh,
-        line_width=args.line_width,
-        ink_level=args.ink_level,
-        background_level=args.background_level,
-        gif_path=args.gif,
-        frames_dir=args.frames_dir,
-        dry_run=args.dry_run,
-    )
+    logging.info(f"Generating Ammann–Beenker patch (limit={args.limit}, window={args.window})")
+    try:
+        points = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
+        logging.info(f"Generated {len(points)} vertices.")
+        logging.info(f"Building Hamiltonian cycle with {args.two_opt_rounds} two-opt rounds.")
+        cycle = build_cycle(points, rng=rng, two_opt_rounds=args.two_opt_rounds)
+        logging.info(f"Cycle constructed with {len(cycle)} points.")
+        # Choose levels: patch faint gray, cycle bright white, background nearly black
+        patch_level = 3
+        cycle_level = 15
+        background_level = 0
+        output_path = args.gif.with_suffix(".png")
+        logging.info(f"Rendering static image to {output_path}")
+        render_static(
+            points=points,
+            cycle=cycle,
+            patch_level=patch_level,
+            cycle_level=cycle_level,
+            background_level=background_level,
+            line_width=args.line_width,
+            output_path=output_path,
+        )
+        logging.info("Static image rendering complete.")
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        raise
+    finally:
+        logging.info("Screensaver tool finished.")
 
 
 if __name__ == "__main__":
