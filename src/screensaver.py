@@ -1,8 +1,8 @@
 """Generate a slowly refreshing Ammann–Beenker maze animation for 540×960 e-paper.
 
-The routine below builds an Ammann–Beenker tiling patch by slicing a
-de Bruijn multigrid, stitches its vertex set into a single randomised
-Hamiltonian-style cycle using a nearest-neighbour/2-opt tour, and renders
+The routine below builds an Ammann–Beenker tiling patch via a
+cut-and-project construction, stitches its vertex set into a single
+randomised Hamiltonian-style cycle using a nearest-neighbour/2-opt tour, and renders
 the incremental drawing to a 16-level grayscale GIF sized for an M5 PaperS3
 panel. Each frame is delayed by ~10 seconds by default so the loop animates
 at an e-paper friendly cadence.
@@ -10,12 +10,12 @@ at an e-paper friendly cadence.
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import math
 import random
 import statistics
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
@@ -55,17 +55,6 @@ class TilingPatch:
 
     points: List[Tuple[float, float]]
     edges: List[Tuple[int, int]]
-
-
-@dataclass
-class GridLine:
-    """Description of a single line in the de Bruijn multigrid."""
-
-    family: int
-    index: int
-    normal: Tuple[float, float]
-    tangent: Tuple[float, float]
-    offset: float
 
 
 @dataclass
@@ -261,160 +250,85 @@ def _biased_transition_cost(
 
 
 def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPatch:
-    """Generate an Ammann–Beenker patch by slicing a de Bruijn multigrid."""
+    """Generate an Ammann–Beenker patch via cut-and-project with square/rhombus tiles."""
 
     if limit < 1:
-        raise ValueError("--limit must be at least 1 to build the multigrid")
+        raise ValueError("--limit must be at least 1 to build the quasicrystal patch")
     if window <= 0:
-        raise ValueError("--window must be positive to control line spacing")
-
-    draw_left = MARGIN
-    draw_right = WIDTH - MARGIN
-    draw_top = MARGIN
-    draw_bottom = HEIGHT - MARGIN
-    center_x = (draw_left + draw_right) * 0.5
-    center_y = (draw_top + draw_bottom) * 0.5
-    half_width = (draw_right - draw_left) * 0.5
-    half_height = (draw_bottom - draw_top) * 0.5
+        raise ValueError("--window must be positive to control the acceptance domain")
 
     angles = [index * math.pi / 4 for index in range(4)]
-    silver_ratio = 1.0 + math.sqrt(2.0)
-
-    # Deterministic irrational offsets keep the grid aperiodic yet visually ordered.
-    offsets = []
-    for family in range(4):
-        base = math.fmod((family + 1) * silver_ratio, 1.0)
-        if base > 0.5:
-            base -= 1.0
-        offsets.append(base)
-    mean_offset = sum(offsets) / len(offsets)
-    offsets = [offset - mean_offset for offset in offsets]
-
-    # Allow a gentle seed-driven phase shift so different seeds explore translations.
-    phase_shift = (rng.random() - 0.5) * 0.25
-    offsets = [offset + phase_shift for offset in offsets]
-
-    spacing_primary = (min(draw_right - draw_left, draw_bottom - draw_top)) / (
-        2 * limit + 1
-    )
-    spacing_primary = max(spacing_primary, 1e-3)
-    spacing_ratio = window
-    spacing_by_family = [
-        spacing_primary,
-        spacing_primary * spacing_ratio,
-        spacing_primary,
-        spacing_primary * spacing_ratio,
+    physical = [(math.cos(angle), math.sin(angle)) for angle in angles]
+    perpendicular = [
+        (math.cos(angle + math.pi / 2), math.sin(angle + math.pi / 2)) for angle in angles
     ]
 
-    families: List[List[GridLine]] = []
-    line_lookup: Dict[Tuple[int, int], GridLine] = {}
-    for family, angle in enumerate(angles):
-        normal = (math.cos(angle), math.sin(angle))
-        tangent = (-normal[1], normal[0])
-        spacing = spacing_by_family[family]
-        shift = offsets[family]
-        family_lines: List[GridLine] = []
-        max_offset = abs(normal[0]) * half_width + abs(normal[1]) * half_height
-        base_offset = normal[0] * center_x + normal[1] * center_y
-        pos_done = False
-        neg_done = False
-        step = 0
-        safety_limit = max(limit * 6, 24)
-        while not (pos_done and neg_done) and step <= safety_limit:
-            indices = [0] if step == 0 else [step, -step]
-            for idx in indices:
-                if idx >= 0 and pos_done:
-                    continue
-                if idx < 0 and neg_done:
-                    continue
-                offset_rel = (idx + shift) * spacing
-                if abs(offset_rel) > max_offset + spacing * 0.55:
-                    if idx >= 0:
-                        pos_done = True
-                    else:
-                        neg_done = True
-                    continue
-                offset_abs = offset_rel + base_offset
-                line = GridLine(
-                    family=family,
-                    index=idx,
-                    normal=normal,
-                    tangent=tangent,
-                    offset=offset_abs,
-                )
-                family_lines.append(line)
-                line_lookup[(family, idx)] = line
-                if idx >= 0:
-                    pos_done = False
-                else:
-                    neg_done = False
-            step += 1
-        if len(family_lines) < 2:
-            raise ValueError(
-                "Insufficient multigrid lines intersect the drawing area; adjust --limit"
-            )
-        families.append(family_lines)
+    lattice_vectors: List[Tuple[int, int, int, int]] = []
+    raw_points: List[Tuple[float, float]] = []
+    index_for_vector: Dict[Tuple[int, int, int, int], int] = {}
 
-    point_index: Dict[Tuple[int, int], int] = {}
-    points: List[Tuple[float, float]] = []
-    line_points: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-    determinant_epsilon = 1e-9
-    quantise_scale = 1e-6
-    inside_tolerance = 1e-6
+    for vector in itertools.product(range(-limit, limit + 1), repeat=4):
+        x = y = u = v = 0.0
+        for coefficient, (px, py), (qx, qy) in zip(vector, physical, perpendicular):
+            x += coefficient * px
+            y += coefficient * py
+            u += coefficient * qx
+            v += coefficient * qy
+        if max(abs(u), abs(v)) <= window:
+            idx = len(raw_points)
+            lattice_vectors.append(vector)
+            raw_points.append((x, y))
+            index_for_vector[vector] = idx
 
-    for first in range(len(families)):
-        for second in range(first + 1, len(families)):
-            for line_a in families[first]:
-                for line_b in families[second]:
-                    det = (
-                        line_a.normal[0] * line_b.normal[1]
-                        - line_a.normal[1] * line_b.normal[0]
-                    )
-                    if abs(det) <= determinant_epsilon:
-                        continue
-                    x = (
-                        line_a.offset * line_b.normal[1]
-                        - line_a.normal[1] * line_b.offset
-                    ) / det
-                    y = (
-                        line_a.normal[0] * line_b.offset
-                        - line_a.offset * line_b.normal[0]
-                    ) / det
-                    if not (
-                        (draw_left - inside_tolerance)
-                        <= x
-                        <= (draw_right + inside_tolerance)
-                        and (draw_top - inside_tolerance)
-                        <= y
-                        <= (draw_bottom + inside_tolerance)
-                    ):
-                        continue
-                    key = (int(round(x / quantise_scale)), int(round(y / quantise_scale)))
-                    idx = point_index.get(key)
-                    if idx is None:
-                        idx = len(points)
-                        point_index[key] = idx
-                        points.append((x, y))
-                    line_points[(line_a.family, line_a.index)].append(idx)
-                    line_points[(line_b.family, line_b.index)].append(idx)
-
-    if not points:
+    if not raw_points:
         raise ValueError("No tiling vertices were generated; adjust --limit/--window")
 
+    theta = rng.randrange(4) * (math.pi / 2)
+    sin_theta = math.sin(theta)
+    cos_theta = math.cos(theta)
+    flipped = rng.choice([False, True])
+
+    transformed: List[Tuple[float, float]] = []
+    for x, y in raw_points:
+        if flipped:
+            x = -x
+        tx = x * cos_theta - y * sin_theta
+        ty = x * sin_theta + y * cos_theta
+        transformed.append((tx, ty))
+
+    xs = [x for x, _ in transformed]
+    ys = [y for _, y in transformed]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x <= 0 or span_y <= 0:
+        raise ValueError("Degenerate patch dimensions detected")
+
+    available_width = WIDTH - 2 * MARGIN
+    available_height = HEIGHT - 2 * MARGIN
+    if available_width <= 0 or available_height <= 0:
+        raise ValueError("Drawing area too small for the given margin")
+
+    scale = min(available_width / span_x, available_height / span_y)
+    scaled_width = span_x * scale
+    scaled_height = span_y * scale
+    offset_x = MARGIN + (available_width - scaled_width) * 0.5 - min_x * scale
+    offset_y = MARGIN + (available_height - scaled_height) * 0.5 - min_y * scale
+
+    points = [(x * scale + offset_x, y * scale + offset_y) for x, y in transformed]
+
     edge_set: set[Tuple[int, int]] = set()
-    for line_id, indices in line_points.items():
-        if len(indices) < 2:
-            continue
-        line = line_lookup[line_id]
-        tangent = line.tangent
-        ordered = sorted(
-            {idx for idx in indices},
-            key=lambda idx: points[idx][0] * tangent[0] + points[idx][1] * tangent[1],
-        )
-        for a, b in zip(ordered[:-1], ordered[1:]):
-            if a == b:
+    for idx, vector in enumerate(lattice_vectors):
+        for axis in range(4):
+            neighbour = list(vector)
+            neighbour[axis] += 1
+            neighbour_tuple = tuple(neighbour)
+            neighbour_idx = index_for_vector.get(neighbour_tuple)
+            if neighbour_idx is None:
                 continue
-            edge_set.add((a, b) if a < b else (b, a))
+            edge = (idx, neighbour_idx) if idx < neighbour_idx else (neighbour_idx, idx)
+            edge_set.add(edge)
 
     edges = sorted(edge_set)
 
@@ -664,8 +578,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     rng = random.Random(args.seed)
     logging.info(
-        "Generating de Bruijn multigrid patch "
-        f"(limit={args.limit}, spacing_ratio={args.window})"
+        "Generating cut-and-project Ammann–Beenker patch "
+        f"(limit={args.limit}, window={args.window})"
     )
     try:
         patch = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
