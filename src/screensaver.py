@@ -1,21 +1,21 @@
 """Generate a slowly refreshing Ammann–Beenker maze animation for 540×960 e-paper.
 
-The routine below builds an Ammann–Beenker tiling patch via the standard
-cut-and-project construction, stitches its vertex set into a single
-randomised Hamiltonian-style cycle using a nearest-neighbour/2-opt tour,
-and renders the incremental drawing to a 16-level grayscale GIF sized for
-an M5 PaperS3 panel. Each frame is delayed by ~10 seconds by default so the
-loop animates at an e-paper friendly cadence.
+The routine below builds an Ammann–Beenker tiling patch by slicing a
+de Bruijn multigrid, stitches its vertex set into a single randomised
+Hamiltonian-style cycle using a nearest-neighbour/2-opt tour, and renders
+the incremental drawing to a 16-level grayscale GIF sized for an M5 PaperS3
+panel. Each frame is delayed by ~10 seconds by default so the loop animates
+at an e-paper friendly cadence.
 """
 from __future__ import annotations
 
 import argparse
-import itertools
 import logging
 import math
 import random
 import statistics
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
@@ -55,6 +55,17 @@ class TilingPatch:
 
     points: List[Tuple[float, float]]
     edges: List[Tuple[int, int]]
+
+
+@dataclass
+class GridLine:
+    """Description of a single line in the de Bruijn multigrid."""
+
+    family: int
+    index: int
+    normal: Tuple[float, float]
+    tangent: Tuple[float, float]
+    offset: float
 
 
 @dataclass
@@ -250,76 +261,132 @@ def _biased_transition_cost(
 
 
 def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPatch:
-    """Generate an Ammann–Beenker tiling patch with vertex and edge data."""
+    """Generate an Ammann–Beenker patch by slicing a de Bruijn multigrid."""
+
+    if limit < 1:
+        raise ValueError("--limit must be at least 1 to build the multigrid")
+    if window <= 0:
+        raise ValueError("--window must be positive to control line spacing")
+
     angles = [index * math.pi / 4 for index in range(4)]
-    physical = [(math.cos(angle), math.sin(angle)) for angle in angles]
-    perpendicular = [
-        (math.cos(angle + math.pi / 2), math.sin(angle + math.pi / 2)) for angle in angles
+    silver_ratio = 1.0 + math.sqrt(2.0)
+
+    # Deterministic irrational offsets keep the grid aperiodic yet visually ordered.
+    offsets = []
+    for family in range(4):
+        base = math.fmod((family + 1) * silver_ratio, 1.0)
+        if base > 0.5:
+            base -= 1.0
+        offsets.append(base)
+    mean_offset = sum(offsets) / len(offsets)
+    offsets = [offset - mean_offset for offset in offsets]
+
+    # Allow a gentle seed-driven phase shift so different seeds explore translations.
+    phase_shift = (rng.random() - 0.5) * 0.25
+    offsets = [offset + phase_shift for offset in offsets]
+
+    spacing_primary = 1.0
+    spacing_ratio = window
+    spacing_by_family = [
+        spacing_primary,
+        spacing_primary * spacing_ratio,
+        spacing_primary,
+        spacing_primary * spacing_ratio,
     ]
 
-    coords: List[Tuple[float, float]] = []
-    lattice_vectors: List[Tuple[int, int, int, int]] = []
-    for vector in itertools.product(range(-limit, limit + 1), repeat=4):
-        x = y = u = v = 0.0
-        for coefficient, (px, py), (qx, qy) in zip(vector, physical, perpendicular):
-            x += coefficient * px
-            y += coefficient * py
-            u += coefficient * qx
-            v += coefficient * qy
-        if max(abs(u), abs(v)) <= window:
-            coords.append((x, y))
-            lattice_vectors.append(tuple(vector))
+    families: List[List[GridLine]] = []
+    line_lookup: Dict[Tuple[int, int], GridLine] = {}
+    for family, angle in enumerate(angles):
+        normal = (math.cos(angle), math.sin(angle))
+        tangent = (-normal[1], normal[0])
+        spacing = spacing_by_family[family]
+        shift = offsets[family]
+        family_lines: List[GridLine] = []
+        for idx in range(-limit, limit + 1):
+            offset = (idx + shift) * spacing
+            line = GridLine(
+                family=family,
+                index=idx,
+                normal=normal,
+                tangent=tangent,
+                offset=offset,
+            )
+            family_lines.append(line)
+            line_lookup[(family, idx)] = line
+        families.append(family_lines)
 
-    if not coords:
+    point_index: Dict[Tuple[int, int], int] = {}
+    points: List[Tuple[float, float]] = []
+    line_points: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    determinant_epsilon = 1e-9
+    quantise_scale = 1e-8
+
+    for first in range(len(families)):
+        for second in range(first + 1, len(families)):
+            for line_a in families[first]:
+                for line_b in families[second]:
+                    det = (
+                        line_a.normal[0] * line_b.normal[1]
+                        - line_a.normal[1] * line_b.normal[0]
+                    )
+                    if abs(det) <= determinant_epsilon:
+                        continue
+                    x = (
+                        line_a.offset * line_b.normal[1]
+                        - line_a.normal[1] * line_b.offset
+                    ) / det
+                    y = (
+                        line_a.normal[0] * line_b.offset
+                        - line_a.offset * line_b.normal[0]
+                    ) / det
+                    key = (int(round(x / quantise_scale)), int(round(y / quantise_scale)))
+                    idx = point_index.get(key)
+                    if idx is None:
+                        idx = len(points)
+                        point_index[key] = idx
+                        points.append((x, y))
+                    line_points[(line_a.family, line_a.index)].append(idx)
+                    line_points[(line_b.family, line_b.index)].append(idx)
+
+    if not points:
         raise ValueError("No tiling vertices were generated; adjust --limit/--window")
 
-    index_by_vector: Dict[Tuple[int, int, int, int], int] = {
-        vector: idx for idx, vector in enumerate(lattice_vectors)
-    }
-    edges: List[Tuple[int, int]] = []
-    for idx, vector in enumerate(lattice_vectors):
-        for dim in range(4):
-            neighbour = list(vector)
-            neighbour[dim] += 1
-            neighbour_tuple = tuple(neighbour)
-            neighbour_idx = index_by_vector.get(neighbour_tuple)
-            if neighbour_idx is not None:
-                edges.append((idx, neighbour_idx))
+    edge_set: set[Tuple[int, int]] = set()
+    for line_id, indices in line_points.items():
+        if len(indices) < 2:
+            continue
+        line = line_lookup[line_id]
+        tangent = line.tangent
+        ordered = sorted(
+            {idx for idx in indices},
+            key=lambda idx: points[idx][0] * tangent[0] + points[idx][1] * tangent[1],
+        )
+        for a, b in zip(ordered[:-1], ordered[1:]):
+            if a == b:
+                continue
+            edge_set.add((a, b) if a < b else (b, a))
 
-    # Apply a random dihedral-8 symmetry to keep runs varied.
-    # Restrict the rotation to multiples of 90° so the patch stays axis aligned.
-    theta = rng.randrange(4) * math.pi / 2
-    sin_theta = math.sin(theta)
-    cos_theta = math.cos(theta)
-    flipped = rng.choice([False, True])
+    edges = sorted(edge_set)
 
-    transformed: List[Tuple[float, float]] = []
-    for x, y in coords:
-        if flipped:
-            x = -x
-        tx = x * cos_theta - y * sin_theta
-        ty = x * sin_theta + y * cos_theta
-        transformed.append((tx, ty))
-
-    xs = [x for x, _ in transformed]
-    ys = [y for _, y in transformed]
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
     span_x = max_x - min_x
     span_y = max_y - min_y
-    if span_x == 0 or span_y == 0:
-        raise ValueError("Degenerate patch dimensions detected")
+    if span_x <= 0 or span_y <= 0:
+        raise ValueError("Degenerate multigrid dimensions detected")
 
-    # --- Aspect ratio fix ---
-    # Instead of uniform scaling, stretch to fill the rectangle
     scale_x = (WIDTH - 2 * MARGIN) / span_x
     scale_y = (HEIGHT - 2 * MARGIN) / span_y
     offset_x = MARGIN - scale_x * min_x
     offset_y = MARGIN - scale_y * min_y
 
-    points = [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in transformed]
+    scaled_points = [
+        (scale_x * x + offset_x, scale_y * y + offset_y) for x, y in points
+    ]
 
-    return TilingPatch(points=points, edges=edges)
+    return TilingPatch(points=scaled_points, edges=edges)
 
 
 def nearest_neighbour_cycle(
@@ -481,12 +548,17 @@ def render_tiling(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, default=7, help="Cut-and-project search radius (default: 7)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=7,
+        help="Half the number of parallel lines per multigrid family (default: 7)",
+    )
     parser.add_argument(
         "--window",
         type=float,
         default=1.6,
-        help="Acceptance window radius in perpendicular space (default: 1.6)",
+        help="Spacing ratio applied to the diagonal multigrid families (default: 1.6)",
     )
     parser.add_argument(
         "--two-opt-rounds",
@@ -559,7 +631,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.info("Screensaver tool started.")
     args = parse_args(argv)
     rng = random.Random(args.seed)
-    logging.info(f"Generating Ammann–Beenker patch (limit={args.limit}, window={args.window})")
+    logging.info(
+        "Generating de Bruijn multigrid patch "
+        f"(limit={args.limit}, spacing_ratio={args.window})"
+    )
     try:
         patch = generate_ab_patch(limit=args.limit, window=args.window, rng=rng)
         points = patch.points
