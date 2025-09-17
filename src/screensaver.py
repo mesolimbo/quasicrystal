@@ -1,7 +1,7 @@
-"""Generate a slowly refreshing Ammann–Beenker maze animation for 540×960 e-paper.
+"""Generate a slowly refreshing Penrose maze animation for 540×960 e-paper.
 
-The routine below builds an Ammann–Beenker tiling patch via a
-cut-and-project construction, stitches its vertex set into a single
+The routine below assembles a Penrose tiling patch from a centred
+five-direction de Bruijn multigrid, stitches its vertex set into a single
 randomised Hamiltonian-style cycle using a nearest-neighbour/2-opt tour, and renders
 the incremental drawing to a 16-level grayscale GIF sized for an M5 PaperS3
 panel. Each frame is delayed by ~10 seconds by default so the loop animates
@@ -10,15 +10,14 @@ at an e-paper friendly cadence.
 from __future__ import annotations
 
 import argparse
-import itertools
 import logging
 import math
 import random
 import statistics
-import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Iterator, List, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -250,54 +249,110 @@ def _biased_transition_cost(
 
 
 def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPatch:
-    """Generate an Ammann–Beenker patch via cut-and-project with square/rhombus tiles."""
+    """Generate a Penrose patch using a five-direction de Bruijn multigrid."""
 
     if limit < 1:
         raise ValueError("--limit must be at least 1 to build the quasicrystal patch")
     if window <= 0:
-        raise ValueError("--window must be positive to control the acceptance domain")
+        raise ValueError("--window must be positive to control the line density")
 
-    angles = [index * math.pi / 4 for index in range(4)]
-    physical = [(math.cos(angle), math.sin(angle)) for angle in angles]
-    perpendicular = [
-        (math.cos(angle + math.pi / 2), math.sin(angle + math.pi / 2)) for angle in angles
-    ]
+    available_width = WIDTH - 2 * MARGIN
+    available_height = HEIGHT - 2 * MARGIN
+    if available_width <= 0 or available_height <= 0:
+        raise ValueError("Drawing area too small for the given margin")
 
-    lattice_vectors: List[Tuple[int, int, int, int]] = []
-    raw_points: List[Tuple[float, float]] = []
-    index_for_vector: Dict[Tuple[int, int, int, int], int] = {}
+    aspect = available_width / available_height
+    norm_min_x = -0.5 * aspect
+    norm_max_x = 0.5 * aspect
+    norm_min_y = -0.5
+    norm_max_y = 0.5
 
-    for vector in itertools.product(range(-limit, limit + 1), repeat=4):
-        x = y = u = v = 0.0
-        for coefficient, (px, py), (qx, qy) in zip(vector, physical, perpendicular):
-            x += coefficient * px
-            y += coefficient * py
-            u += coefficient * qx
-            v += coefficient * qy
-        if max(abs(u), abs(v)) <= window:
-            idx = len(raw_points)
-            lattice_vectors.append(vector)
-            raw_points.append((x, y))
-            index_for_vector[vector] = idx
+    density = max(window, 1e-6)
+    base_span = max(norm_max_x - norm_min_x, norm_max_y - norm_min_y)
+    spacing = base_span / ((2 * limit + 1) * density)
 
-    if not raw_points:
+    base_angle = rng.random() * (2 * math.pi / 5)
+    angles = [base_angle + 2 * math.pi * i / 5 for i in range(5)]
+    normals = [(math.cos(angle), math.sin(angle)) for angle in angles]
+    directions = [(-math.sin(angle), math.cos(angle)) for angle in angles]
+    offsets = [rng.random() for _ in range(5)]
+
+    line_families: List[List[int]] = []
+    for index, normal in enumerate(normals):
+        projections = [
+            norm_min_x * normal[0] + norm_min_y * normal[1],
+            norm_min_x * normal[0] + norm_max_y * normal[1],
+            norm_max_x * normal[0] + norm_min_y * normal[1],
+            norm_max_x * normal[0] + norm_max_y * normal[1],
+        ]
+        scaled_min = min(projections) / spacing - offsets[index]
+        scaled_max = max(projections) / spacing - offsets[index]
+        lower = math.floor(scaled_min) - limit
+        upper = math.ceil(scaled_max) + limit
+        if lower > upper:
+            lower, upper = upper, lower
+        line_families.append(list(range(lower, upper + 1)))
+
+    tolerance = 1e-6
+    epsilon = 1e-9
+    point_lookup: dict[Tuple[int, int], int] = {}
+    points: List[Tuple[float, float]] = []
+    line_points: defaultdict[Tuple[int, int], List[int]] = defaultdict(list)
+
+    for family_a in range(5):
+        normal_a = normals[family_a]
+        offset_a = offsets[family_a]
+        for family_b in range(family_a + 1, 5):
+            normal_b = normals[family_b]
+            offset_b = offsets[family_b]
+            det = normal_a[0] * normal_b[1] - normal_a[1] * normal_b[0]
+            if abs(det) <= 1e-9:
+                continue
+            for index_a in line_families[family_a]:
+                intercept_a = (index_a + offset_a) * spacing
+                for index_b in line_families[family_b]:
+                    intercept_b = (index_b + offset_b) * spacing
+                    x = (intercept_a * normal_b[1] - normal_a[1] * intercept_b) / det
+                    y = (normal_a[0] * intercept_b - intercept_a * normal_b[0]) / det
+                    if not (
+                        norm_min_x - epsilon
+                        <= x
+                        <= norm_max_x + epsilon
+                        and norm_min_y - epsilon
+                        <= y
+                        <= norm_max_y + epsilon
+                    ):
+                        continue
+                    key = (round(x / tolerance), round(y / tolerance))
+                    idx = point_lookup.get(key)
+                    if idx is None:
+                        idx = len(points)
+                        point_lookup[key] = idx
+                        points.append((x, y))
+                    line_points[(family_a, index_a)].append(idx)
+                    line_points[(family_b, index_b)].append(idx)
+
+    if not points:
         raise ValueError("No tiling vertices were generated; adjust --limit/--window")
 
-    theta = rng.randrange(4) * (math.pi / 2)
-    sin_theta = math.sin(theta)
-    cos_theta = math.cos(theta)
-    flipped = rng.choice([False, True])
+    edge_set: set[Tuple[int, int]] = set()
+    for (family, index), entries in line_points.items():
+        if len(entries) < 2:
+            continue
+        direction = directions[family]
+        sorted_indices = sorted(
+            set(entries),
+            key=lambda idx: points[idx][0] * direction[0] + points[idx][1] * direction[1],
+        )
+        for a, b in zip(sorted_indices, sorted_indices[1:]):
+            edge = (a, b) if a < b else (b, a)
+            edge_set.add(edge)
 
-    transformed: List[Tuple[float, float]] = []
-    for x, y in raw_points:
-        if flipped:
-            x = -x
-        tx = x * cos_theta - y * sin_theta
-        ty = x * sin_theta + y * cos_theta
-        transformed.append((tx, ty))
+    if not edge_set:
+        raise ValueError("No tiling edges were generated; adjust --limit/--window")
 
-    xs = [x for x, _ in transformed]
-    ys = [y for _, y in transformed]
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
     span_x = max_x - min_x
@@ -305,34 +360,16 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
     if span_x <= 0 or span_y <= 0:
         raise ValueError("Degenerate patch dimensions detected")
 
-    available_width = WIDTH - 2 * MARGIN
-    available_height = HEIGHT - 2 * MARGIN
-    if available_width <= 0 or available_height <= 0:
-        raise ValueError("Drawing area too small for the given margin")
-
     scale = min(available_width / span_x, available_height / span_y)
     scaled_width = span_x * scale
     scaled_height = span_y * scale
     offset_x = MARGIN + (available_width - scaled_width) * 0.5 - min_x * scale
     offset_y = MARGIN + (available_height - scaled_height) * 0.5 - min_y * scale
 
-    points = [(x * scale + offset_x, y * scale + offset_y) for x, y in transformed]
-
-    edge_set: set[Tuple[int, int]] = set()
-    for idx, vector in enumerate(lattice_vectors):
-        for axis in range(4):
-            neighbour = list(vector)
-            neighbour[axis] += 1
-            neighbour_tuple = tuple(neighbour)
-            neighbour_idx = index_for_vector.get(neighbour_tuple)
-            if neighbour_idx is None:
-                continue
-            edge = (idx, neighbour_idx) if idx < neighbour_idx else (neighbour_idx, idx)
-            edge_set.add(edge)
-
+    scaled_points = [(x * scale + offset_x, y * scale + offset_y) for x, y in points]
     edges = sorted(edge_set)
 
-    return TilingPatch(points=points, edges=edges)
+    return TilingPatch(points=scaled_points, edges=edges)
 
 
 def nearest_neighbour_cycle(
@@ -473,7 +510,7 @@ def render_tiling(
     line_width: int,
     output_path: Path,
 ) -> Image.Image:
-    """Render only the Ammann–Beenker tiling geometry."""
+    """Render only the Penrose tiling geometry."""
 
     image = Image.new("L", (WIDTH, HEIGHT), color=gray_level(background_level))
     draw = ImageDraw.Draw(image)
@@ -498,13 +535,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=7,
-        help="Half the number of parallel lines per multigrid family (default: 7)",
+        help="Half the number of parallel lines per pentagrid family (default: 7)",
     )
     parser.add_argument(
         "--window",
         type=float,
         default=1.6,
-        help="Spacing ratio applied to the diagonal multigrid families (default: 1.6)",
+        help="Density multiplier applied to the pentagrid spacing (default: 1.6)",
     )
     parser.add_argument(
         "--two-opt-rounds",
@@ -578,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     rng = random.Random(args.seed)
     logging.info(
-        "Generating cut-and-project Ammann–Beenker patch "
+        "Generating Penrose pentagrid patch "
         f"(limit={args.limit}, window={args.window})"
     )
     try:
