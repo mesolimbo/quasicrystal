@@ -70,9 +70,10 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
         raise ValueError("No tiling vertices were generated; adjust --limit/--window")
 
     # Apply a random dihedral-8 symmetry to keep runs varied.
-    rotation = rng.randrange(8)
-    sin_theta = math.sin(rotation * math.pi / 4)
-    cos_theta = math.cos(rotation * math.pi / 4)
+    # Restrict the rotation to multiples of 90° so the patch stays axis aligned.
+    theta = rng.randrange(4) * math.pi / 2
+    sin_theta = math.sin(theta)
+    cos_theta = math.cos(theta)
     flipped = rng.choice([False, True])
 
     transformed: List[Tuple[float, float]] = []
@@ -134,17 +135,18 @@ def two_opt_improvement(
     n = len(cycle)
     for _ in range(max_rounds):
         improved = False
-        indices = list(range(n - 2))
+        indices = list(range(n - 1))
         rng.shuffle(indices)
         for i in indices:
             a = cycle[i]
             b = cycle[i + 1]
             ax, ay = points[a]
             bx, by = points[b]
-            for j in range(i + 2, n if i > 0 else n - 1):
+            upper = n if i > 0 else n - 1
+            for j in range(i + 2, upper):
                 c = cycle[j]
                 d = cycle[(j + 1) % n]
-                if a == d:
+                if a == d or b == c:
                     continue
                 cx, cy = points[c]
                 dx, dy = points[d]
@@ -153,9 +155,6 @@ def two_opt_improvement(
                 if swapped_length + 1e-9 < current_length:
                     cycle[i + 1 : j + 1] = reversed(cycle[i + 1 : j + 1])
                     improved = True
-                    break
-            if improved:
-                break
         if not improved:
             break
 
@@ -229,7 +228,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--two-opt-rounds",
         type=int,
-        default=4,
+        default=48,
         help="Maximum number of 2-opt refinement sweeps applied to the tour",
     )
     parser.add_argument(
