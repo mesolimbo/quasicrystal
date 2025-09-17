@@ -14,11 +14,13 @@ import itertools
 import logging
 import math
 import random
+import statistics
 import time
 from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence, Tuple
 
 from PIL import Image, ImageDraw
+from dataclasses import dataclass
 
 WIDTH = 540
 HEIGHT = 960
@@ -45,6 +47,133 @@ def build_palette_image() -> Image.Image:
 
 
 PALETTE_IMAGE = build_palette_image()
+
+
+@dataclass
+class CycleBias:
+    """Metadata describing how to bias the Hamiltonian towards circular motifs."""
+
+    radii: List[float]
+    angles: List[float]
+    ring_ids: List[int]
+    target_steps: List[float]
+    radius_scale: float
+    mean_radius: float
+    radial_weight: float
+    angle_weight: float
+    direction: int
+    ring_counts: List[int]
+    remaining_per_ring: List[int]
+    jitter: float
+
+
+def compute_cycle_bias(points: Sequence[Tuple[float, float]], rng: random.Random) -> CycleBias | None:
+    """Return heuristic information that biases the tour towards concentric loops."""
+
+    if len(points) < 8:
+        # Tiny patches don't benefit meaningfully from the additional structure.
+        return None
+
+    cx = sum(x for x, _ in points) / len(points)
+    cy = sum(y for _, y in points) / len(points)
+    radii = [math.hypot(x - cx, y - cy) for x, y in points]
+    if not radii:
+        return None
+
+    angles = [math.atan2(y - cy, x - cx) for x, y in points]
+    min_radius = min(radii)
+    max_radius = max(radii)
+    radius_span = max_radius - min_radius
+    if radius_span <= 1e-6:
+        return None
+
+    # Break the patch into a stack of radial "rings" so that we can
+    # encourage local walks that sweep around each band before moving on.
+    ring_count = max(4, min(48, int(round(math.sqrt(len(points))))))
+    ring_width = radius_span / ring_count if ring_count > 0 else radius_span
+    if ring_width <= 1e-6:
+        return None
+
+    ring_ids: List[int] = []
+    for radius in radii:
+        ring_index = int((radius - min_radius) / ring_width)
+        ring_ids.append(max(0, min(ring_count - 1, ring_index)))
+
+    ring_counts = [0] * ring_count
+    for ring_index in ring_ids:
+        ring_counts[ring_index] += 1
+
+    target_steps: List[float] = []
+    for ring_index in ring_ids:
+        count = max(1, ring_counts[ring_index])
+        # A simple proxy for the angular separation of vertices within the ring.
+        target_steps.append(2 * math.pi / count)
+
+    mean_radius = sum(radii) / len(radii)
+    radius_scale = statistics.pstdev(radii)
+    if radius_scale <= 1e-6:
+        radius_scale = max(mean_radius, 1.0)
+
+    radial_weight = mean_radius
+    angle_weight = max(24.0, mean_radius / 2.0)
+    direction = rng.choice([-1, 1])
+    remaining_per_ring = ring_counts.copy()
+    jitter = max(0.05, radius_span / len(points) * 0.5)
+
+    return CycleBias(
+        radii=radii,
+        angles=angles,
+        ring_ids=ring_ids,
+        target_steps=target_steps,
+        radius_scale=radius_scale,
+        mean_radius=mean_radius,
+        radial_weight=radial_weight,
+        angle_weight=angle_weight,
+        direction=direction,
+        ring_counts=ring_counts,
+        remaining_per_ring=remaining_per_ring,
+        jitter=jitter,
+    )
+
+
+def _biased_transition_cost(
+    current: int,
+    candidate: int,
+    points: Sequence[Tuple[float, float]],
+    bias: CycleBias,
+    rng: random.Random,
+) -> float:
+    """Return a weighted cost encouraging circular sweeps with gentle radial drift."""
+
+    cx, cy = points[current]
+    nx, ny = points[candidate]
+    distance = math.hypot(nx - cx, ny - cy)
+
+    r_current = bias.radii[current]
+    r_candidate = bias.radii[candidate]
+    dr = abs(r_candidate - r_current)
+
+    ring_index = bias.ring_ids[candidate]
+    ring_total = max(1, bias.ring_counts[ring_index])
+    remaining = max(0, bias.remaining_per_ring[ring_index])
+    remaining_ratio = remaining / ring_total
+    radial_weight = bias.radial_weight * (0.25 + 0.75 * remaining_ratio)
+    radial_penalty = radial_weight * (dr / bias.radius_scale) ** 2
+
+    theta_current = bias.angles[current]
+    theta_candidate = bias.angles[candidate]
+    if bias.direction > 0:
+        diff = (theta_candidate - theta_current) % (2 * math.pi)
+    else:
+        diff = (theta_current - theta_candidate) % (2 * math.pi)
+
+    target = (bias.target_steps[current] + bias.target_steps[candidate]) * 0.5
+    angle_penalty = bias.angle_weight * (diff - target) ** 2
+    if diff > math.pi:
+        # Strongly discourage hard reversals that fold the loop back onto itself.
+        angle_penalty += bias.angle_weight * 0.25 * (diff - math.pi) ** 2
+
+    return distance + radial_penalty + angle_penalty + bias.jitter * rng.random()
 
 
 def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tuple[float, float]]:
@@ -103,20 +232,35 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> List[Tup
     return [(scale_x * x + offset_x, scale_y * y + offset_y) for x, y in transformed]
 
 
-def nearest_neighbour_cycle(points: Sequence[Tuple[float, float]], rng: random.Random) -> List[int]:
+def nearest_neighbour_cycle(
+    points: Sequence[Tuple[float, float]],
+    rng: random.Random,
+    bias: CycleBias | None = None,
+) -> List[int]:
     """Generate an initial tour using a nearest-neighbour walk."""
     unused = list(range(len(points)))
     current = unused.pop(rng.randrange(len(unused)))
     cycle = [current]
 
+    if bias is not None:
+        bias.remaining_per_ring[bias.ring_ids[current]] -= 1
+
     while unused:
-        cx, cy = points[current]
-        next_index = min(
-            unused,
-            key=lambda idx: (points[idx][0] - cx) ** 2 + (points[idx][1] - cy) ** 2,
-        )
+        if bias is None:
+            cx, cy = points[current]
+            next_index = min(
+                unused,
+                key=lambda idx: (points[idx][0] - cx) ** 2 + (points[idx][1] - cy) ** 2,
+            )
+        else:
+            next_index = min(
+                unused,
+                key=lambda idx: _biased_transition_cost(current, idx, points, bias, rng),
+            )
         unused.remove(next_index)
         cycle.append(next_index)
+        if bias is not None:
+            bias.remaining_per_ring[bias.ring_ids[next_index]] -= 1
         current = next_index
 
     return cycle
@@ -165,7 +309,8 @@ def build_cycle(
     two_opt_rounds: int,
 ) -> List[int]:
     """Construct a Hamiltonian-style cycle visiting each vertex exactly once."""
-    cycle = nearest_neighbour_cycle(points, rng)
+    bias = compute_cycle_bias(points, rng)
+    cycle = nearest_neighbour_cycle(points, rng, bias=bias)
     two_opt_improvement(cycle, points, rng, two_opt_rounds)
     return cycle
 
