@@ -268,6 +268,15 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
     if window <= 0:
         raise ValueError("--window must be positive to control line spacing")
 
+    draw_left = MARGIN
+    draw_right = WIDTH - MARGIN
+    draw_top = MARGIN
+    draw_bottom = HEIGHT - MARGIN
+    center_x = (draw_left + draw_right) * 0.5
+    center_y = (draw_top + draw_bottom) * 0.5
+    half_width = (draw_right - draw_left) * 0.5
+    half_height = (draw_bottom - draw_top) * 0.5
+
     angles = [index * math.pi / 4 for index in range(4)]
     silver_ratio = 1.0 + math.sqrt(2.0)
 
@@ -285,7 +294,10 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
     phase_shift = (rng.random() - 0.5) * 0.25
     offsets = [offset + phase_shift for offset in offsets]
 
-    spacing_primary = 1.0
+    spacing_primary = (min(draw_right - draw_left, draw_bottom - draw_top)) / (
+        2 * limit + 1
+    )
+    spacing_primary = max(spacing_primary, 1e-3)
     spacing_ratio = window
     spacing_by_family = [
         spacing_primary,
@@ -302,24 +314,53 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
         spacing = spacing_by_family[family]
         shift = offsets[family]
         family_lines: List[GridLine] = []
-        for idx in range(-limit, limit + 1):
-            offset = (idx + shift) * spacing
-            line = GridLine(
-                family=family,
-                index=idx,
-                normal=normal,
-                tangent=tangent,
-                offset=offset,
+        max_offset = abs(normal[0]) * half_width + abs(normal[1]) * half_height
+        base_offset = normal[0] * center_x + normal[1] * center_y
+        pos_done = False
+        neg_done = False
+        step = 0
+        safety_limit = max(limit * 6, 24)
+        while not (pos_done and neg_done) and step <= safety_limit:
+            indices = [0] if step == 0 else [step, -step]
+            for idx in indices:
+                if idx >= 0 and pos_done:
+                    continue
+                if idx < 0 and neg_done:
+                    continue
+                offset_rel = (idx + shift) * spacing
+                if abs(offset_rel) > max_offset + spacing * 0.55:
+                    if idx >= 0:
+                        pos_done = True
+                    else:
+                        neg_done = True
+                    continue
+                offset_abs = offset_rel + base_offset
+                line = GridLine(
+                    family=family,
+                    index=idx,
+                    normal=normal,
+                    tangent=tangent,
+                    offset=offset_abs,
+                )
+                family_lines.append(line)
+                line_lookup[(family, idx)] = line
+                if idx >= 0:
+                    pos_done = False
+                else:
+                    neg_done = False
+            step += 1
+        if len(family_lines) < 2:
+            raise ValueError(
+                "Insufficient multigrid lines intersect the drawing area; adjust --limit"
             )
-            family_lines.append(line)
-            line_lookup[(family, idx)] = line
         families.append(family_lines)
 
     point_index: Dict[Tuple[int, int], int] = {}
     points: List[Tuple[float, float]] = []
     line_points: Dict[Tuple[int, int], List[int]] = defaultdict(list)
     determinant_epsilon = 1e-9
-    quantise_scale = 1e-8
+    quantise_scale = 1e-6
+    inside_tolerance = 1e-6
 
     for first in range(len(families)):
         for second in range(first + 1, len(families)):
@@ -339,6 +380,15 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
                         line_a.normal[0] * line_b.offset
                         - line_a.offset * line_b.normal[0]
                     ) / det
+                    if not (
+                        (draw_left - inside_tolerance)
+                        <= x
+                        <= (draw_right + inside_tolerance)
+                        and (draw_top - inside_tolerance)
+                        <= y
+                        <= (draw_bottom + inside_tolerance)
+                    ):
+                        continue
                     key = (int(round(x / quantise_scale)), int(round(y / quantise_scale)))
                     idx = point_index.get(key)
                     if idx is None:
@@ -368,25 +418,7 @@ def generate_ab_patch(limit: int, window: float, rng: random.Random) -> TilingPa
 
     edges = sorted(edge_set)
 
-    xs = [x for x, _ in points]
-    ys = [y for _, y in points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span_x = max_x - min_x
-    span_y = max_y - min_y
-    if span_x <= 0 or span_y <= 0:
-        raise ValueError("Degenerate multigrid dimensions detected")
-
-    scale_x = (WIDTH - 2 * MARGIN) / span_x
-    scale_y = (HEIGHT - 2 * MARGIN) / span_y
-    offset_x = MARGIN - scale_x * min_x
-    offset_y = MARGIN - scale_y * min_y
-
-    scaled_points = [
-        (scale_x * x + offset_x, scale_y * y + offset_y) for x, y in points
-    ]
-
-    return TilingPatch(points=scaled_points, edges=edges)
+    return TilingPatch(points=points, edges=edges)
 
 
 def nearest_neighbour_cycle(
