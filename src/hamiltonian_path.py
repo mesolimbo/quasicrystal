@@ -24,14 +24,18 @@ MARGIN = 12  # pixel padding around the drawing region
 
 def extract_vertices_from_tiling(tiling: AmmannBeenkerTiling,
                                k_range: range = None) -> List[Tuple[float, float]]:
-    """Extract all unique vertices from the Ammann-Beenker tiling."""
+    """Extract all unique vertices from the Ammann-Beenker tiling.
+
+    Uses the EXACT same coordinate transformation as the grid plotting
+    to ensure perfect alignment.
+    """
     if k_range is None:
         k_range = range(-15, 16)
 
-    # Generate tiles
+    # Generate tiles using the same parameters as the grid
     squares, rhombi = tiling.generate_tiles(k_range, width=5.4, height=9.6)
 
-    # Collect all unique vertices
+    # Collect all unique vertices in the tiling's native coordinate system
     vertex_set = set()
 
     # Add vertices from squares
@@ -48,31 +52,27 @@ def extract_vertices_from_tiling(tiling: AmmannBeenkerTiling,
             vertex_tuple = (round(vertex[0], 6), round(vertex[1], 6))
             vertex_set.add(vertex_tuple)
 
-    # Convert to list and scale to pixel coordinates
+    # Convert to list - keep in tiling coordinate system
     vertices = list(vertex_set)
 
-    # Transform coordinates to fit within 540x960 with margins
     if not vertices:
         raise ValueError("No vertices generated from tiling")
 
-    xs = [x for x, y in vertices]
-    ys = [y for x, y in vertices]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span_x = max_x - min_x
-    span_y = max_y - min_y
+    # Transform using EXACTLY the same method as the grid plotting
+    # Grid uses: ax.set_xlim(-half_width, half_width), ax.set_ylim(-half_height, half_height)
+    # where half_width = 2.7, half_height = 4.8
+    # Then maps to 540x960 pixels
 
-    if span_x == 0 or span_y == 0:
-        raise ValueError("Degenerate vertex dimensions detected")
+    half_width = 5.4 / 2   # 2.7
+    half_height = 9.6 / 2  # 4.8
 
-    # Scale to fit within margins
-    scale_x = (WIDTH - 2 * MARGIN) / span_x
-    scale_y = (HEIGHT - 2 * MARGIN) / span_y
-    offset_x = MARGIN - scale_x * min_x
-    offset_y = MARGIN - scale_y * min_y
-
-    scaled_vertices = [(scale_x * x + offset_x, scale_y * y + offset_y)
-                      for x, y in vertices]
+    # Convert from tiling coordinates (-2.7 to 2.7, -4.8 to 4.8) to pixel coordinates (0 to 540, 0 to 960)
+    scaled_vertices = []
+    for x, y in vertices:
+        # Map from tiling coordinate system to pixel coordinates
+        pixel_x = (x + half_width) * (WIDTH / 5.4)   # Convert to 0-540 range
+        pixel_y = (y + half_height) * (HEIGHT / 9.6)  # Convert to 0-960 range
+        scaled_vertices.append((pixel_x, pixel_y))
 
     return scaled_vertices
 
