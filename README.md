@@ -2,7 +2,9 @@
 
 This repository contains a Python utility that generates a slowly unfolding,
 Hamiltonian-style maze on top of an Ammann–Beenker tiling patch sized for the
-540×960 M5 PaperS3 e-paper panel. Each run synthesises a fresh loop by cutting
+540×960 M5 PaperS3 e-paper panel.
+
+Each run synthesises a fresh loop by cutting
 a patch of the tiling via the classic 4D cut-and-project method, connecting all
 vertices with a nearest-neighbour/2-opt tour, and rendering the segments in
 discrete 10 second bursts. Output is recorded as a 16-level grayscale GIF so it
