@@ -1,6 +1,6 @@
 # Quasicrystal Screensaver
 
-This repository contains a Python utility that generates a slowly unfolding,
+This repository contains a draft Python utility that will ultimately generates a slowly unfolding,
 Hamiltonian-style maze on top of an Ammann–Beenker tiling patch sized for the
 540×960 M5 PaperS3 e-paper panel.
 
