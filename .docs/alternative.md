@@ -1,4 +1,5 @@
-Hamiltonian Cycle Construction on Ammann-Beenker Tiling (U<sub>2</sub> Structure)
+# Hamiltonian Cycle Construction on Ammann-Beenker Tiling (U<sub>2</sub> Structure)
+
 Overview of the Algorithm (Singh et al., 2024)
 
 The construction follows a recursive, fractal loop-building algorithm on the Ammann-Beenker (AB) tiling. At each level L<sub>n</sub>, we form fully-packed loops (FPLs) that cover all vertices of certain types, then “inflate” these loops to higher levels, ultimately merging them into a single Hamiltonian cycle. Key steps include:
